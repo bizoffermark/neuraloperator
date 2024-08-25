@@ -257,14 +257,17 @@ class FNO(BaseModel, name='FNO'):
         if self.complex_data:
             self.lifting = ComplexValued(self.lifting)
 
-        self.projection = ChannelMLP(
-            in_channels=self.hidden_channels,
-            out_channels=out_channels,
-            hidden_channels=self.projection_channels,
-            n_layers=2,
-            n_dim=self.n_dim,
-            non_linearity=non_linearity,
-        )
+        if self.projection_channels is None:
+            self.projection = nn.Identity()
+        else:
+            self.projection = ChannelMLP(
+                in_channels=self.hidden_channels,
+                out_channels=out_channels,
+                hidden_channels=self.projection_channels,
+                n_layers=2,
+                n_dim=self.n_dim,
+                non_linearity=non_linearity,
+            )
         if self.complex_data:
             self.projection = ComplexValued(self.projection)
 
