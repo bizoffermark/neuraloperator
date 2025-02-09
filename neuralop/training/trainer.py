@@ -1,11 +1,14 @@
-import torch
-from torch.cuda import amp
-from torch import nn
 from timeit import default_timer
 from pathlib import Path
 from typing import Union
 import sys
+import warnings
 
+import torch
+from torch.cuda import amp
+from torch import nn
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 # Only import wandb and use if installed
 wandb_available = False
 try:
@@ -80,6 +83,9 @@ class Trainer:
                 self.autocast_device_type = "cpu"
         self.mixed_precision = mixed_precision
         self.data_processor = data_processor
+    
+        # Track starting epoch for checkpointing/resuming
+        self.start_epoch = 0
 
     def train(
         self,
@@ -95,7 +101,9 @@ class Trainer:
         save_dir: Union[str, Path]="./ckpt",
         resume_from_dir: Union[str, Path]=None,
     ):
-        """Trains the given model on the given datasets.
+        """Trains the given model on the given dataset.
+
+        If a device is provided, the model and data processor are loaded to device here. 
 
         Parameters
         -----------
@@ -105,7 +113,7 @@ class Trainer:
             testing dataloaders
         optimizer: torch.optim.Optimizer
             optimizer to use during training
-        optimizer: torch.optim.lr_scheduler
+        scheduler: torch.optim.lr_scheduler
             learning rate scheduler to use during training
         training_loss: training.losses function
             cost function to minimize
@@ -142,6 +150,13 @@ class Trainer:
 
         if training_loss is None:
             training_loss = LpLoss(d=2)
+        
+        # Warn the user if training loss is reducing across the batch
+        if hasattr(training_loss, 'reduction'):
+            if training_loss.reduction == "mean":
+                warnings.warn(f"{training_loss.reduction=}. This means that the loss is "
+                              "initialized to average across the batch dim. The Trainer "
+                              "expects losses to sum across the batch dim.")
 
         if eval_losses is None:  # By default just evaluate on the training loss
             eval_losses = dict(l2=training_loss)
@@ -154,6 +169,17 @@ class Trainer:
         self.save_best = save_best
         if resume_from_dir is not None:
             self.resume_state_from_dir(resume_from_dir)
+
+        # Load model and data_processor to device
+        self.model = self.model.to(self.device)
+
+        if self.use_distributed and dist.is_initialized():
+            device_id = dist.get_rank()
+            self.model = DDP(self.model, device_ids=[device_id], output_device=device_id)
+
+        if self.data_processor is not None:
+            self.data_processor = self.data_processor.to(self.device)
+        
         # ensure save_best is a metric we collect
         if self.save_best is not None:
             metrics = []
@@ -172,7 +198,7 @@ class Trainer:
                   f'         on resolutions {[name for name in test_loaders]}.')
             sys.stdout.flush()
         
-        for epoch in range(self.n_epochs):
+        for epoch in range(self.start_epoch, self.n_epochs):
             train_err, avg_loss, avg_lasso_loss, epoch_train_time =\
                   self.train_one_epoch(epoch, train_loader, training_loss)
             epoch_metrics = dict(
@@ -304,12 +330,25 @@ class Trainer:
         errors : dict
             dict[f'{log_prefix}_{loss_name}] = loss for loss in loss_dict
         """
+        # Ensure model and data processor are loaded to the proper device
 
+        self.model = self.model.to(self.device)
+        if self.data_processor is not None and self.data_processor.device != self.device:
+            self.data_processor = self.data_processor.to(self.device)
+        
         self.model.eval()
         if self.data_processor:
             self.data_processor.eval()
 
         errors = {f"{log_prefix}_{loss_name}": 0 for loss_name in loss_dict.keys()}
+
+        # Warn the user if any of the eval losses is reducing across the batch
+        for _, eval_loss in loss_dict.items():
+            if hasattr(eval_loss, 'reduction'):
+                if eval_loss.reduction == "mean":
+                    warnings.warn(f"{eval_loss.reduction=}. This means that the loss is "
+                                "initialized to average across the batch dim. The Trainer "
+                                "expects losses to sum across the batch dim.")
 
         self.n_samples = 0
         with torch.no_grad():
@@ -368,7 +407,6 @@ class Trainer:
         self.optimizer.zero_grad(set_to_none=True)
         if self.regularizer:
             self.regularizer.reset()
-
         if self.data_processor is not None:
             sample = self.data_processor.preprocess(sample)
         else:
@@ -559,16 +597,25 @@ class Trainer:
         else:
             raise FileNotFoundError("Error: resume_from_dir expects a model\
                                         state dict named model.pt or best_model.pt.")
-        # returns model, loads other modules in-place if provided
-        self.model = load_training_state(save_dir=save_dir, save_name=save_name,
+        # returns model, loads other modules if provided
+        self.model, self.optimizer, self.scheduler, self.regularizer, resume_epoch =\
+            load_training_state(save_dir=save_dir, save_name=save_name,
                                                 model=self.model,
                                                 optimizer=self.optimizer,
                                                 regularizer=self.regularizer,
                                                 scheduler=self.scheduler)
 
+        if resume_epoch is not None:
+            if resume_epoch > self.start_epoch:
+                self.start_epoch = resume_epoch
+                if self.verbose:
+                    print(f"Trainer resuming from epoch {resume_epoch}")
+
+
     def checkpoint(self, save_dir):
         """checkpoint saves current training state
-        to a directory for resuming later.
+        to a directory for resuming later. Only saves 
+        training state on the first GPU. 
         See neuralop.training.training_state
 
         Parameters
@@ -576,18 +623,20 @@ class Trainer:
         save_dir : str | Path
             directory in which to save training state
         """
-        if self.save_best is not None:
-            save_name = 'best_model'
-        else:
-            save_name = "model"
-        save_training_state(save_dir=save_dir, 
-                            save_name=save_name,
-                            model=self.model,
-                            optimizer=self.optimizer,
-                            scheduler=self.scheduler,
-                            regularizer=self.regularizer
-                            )
-        if self.verbose:
-            print(f"Saved training state to {save_dir}")
+        if comm.get_local_rank() == 0:
+            if self.save_best is not None:
+                save_name = 'best_model'
+            else:
+                save_name = "model"
+            save_training_state(save_dir=save_dir, 
+                                save_name=save_name,
+                                model=self.model,
+                                optimizer=self.optimizer,
+                                scheduler=self.scheduler,
+                                regularizer=self.regularizer,
+                                epoch=self.epoch
+                                )
+            if self.verbose:
+                print(f"[Rank 0]: saved training state to {save_dir}")
 
        
